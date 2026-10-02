@@ -137,6 +137,16 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigValidationError> {
             return Err(ConfigValidationError::InvalidInternalTools);
         }
         service_peer(&config.masking)?;
+    } else if let Err(ConfigError::Unsupported { field }) = Peer::from_config(
+        config.masking.service_expected_uid,
+        config.masking.service_expected_sid.as_deref(),
+        config.masking.service_expected_exe.as_deref(),
+    ) {
+        // Поле чужой ОС — ошибка и при выключенном обезличивании, а не молчаливое игнорирование.
+        return Err(ConfigValidationError::InvalidServiceIdentity {
+            field: identity_field(field),
+            reason: "is not supported on this OS",
+        });
     }
 
     Ok(())
@@ -273,6 +283,26 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("masking.service_expected_"), "{text}");
         assert!(!text.contains("secret") && !text.contains("994"), "{text}");
+    }
+
+    /// Поле чужой ОС — ошибка и при выключенном обезличивании.
+    #[test]
+    fn disabled_masking_still_rejects_foreign_os_identity_field() {
+        let mut cfg = base_config();
+        cfg.masking.enabled = false;
+        assert!(validate(&cfg).is_ok());
+        #[cfg(unix)]
+        {
+            cfg.masking.service_expected_exe = Some(PathBuf::from("/secret/service.exe"));
+        }
+        #[cfg(windows)]
+        {
+            cfg.masking.service_expected_uid = Some(994);
+        }
+        assert!(matches!(
+            validate(&cfg),
+            Err(ConfigValidationError::InvalidServiceIdentity { .. })
+        ));
     }
 
     #[test]
