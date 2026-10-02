@@ -1185,13 +1185,18 @@ mod tests {
         // при регистрации (здесь фикстура сразу несёт ключ).
         let cluster_guid = uuid::Uuid::new_v4();
         let infobase_guid = uuid::Uuid::new_v4();
-        let masking = crate::config::model::MaskingConfig {
+        let mut masking = crate::config::model::MaskingConfig {
             enabled: true,
-            socket_path: temp.path().join("service-not-running.sock"),
-            internal_listen_path: temp.path().join("manager.sock"),
-            service_expected_uid: Some(994),
+            socket_path: crate::config::model::MaskingConfig::test_endpoint_path(
+                &temp,
+                "service-not-running",
+            ),
+            internal_listen_path: crate::config::model::MaskingConfig::test_endpoint_path(
+                &temp, "manager",
+            ),
             ..Default::default()
         };
+        masking.set_test_service_identity(false);
         let config = Arc::new(AppConfig {
             work_path: PathBuf::from(temp.path()),
             mcp: McpConfig::default(),
@@ -1305,13 +1310,18 @@ mod tests {
         // при регистрации (здесь фикстура сразу несёт ключ).
         let cluster_guid = uuid::Uuid::new_v4();
         let infobase_guid = uuid::Uuid::new_v4();
-        let masking = crate::config::model::MaskingConfig {
+        let mut masking = crate::config::model::MaskingConfig {
             enabled: true,
-            socket_path: temp.path().join("service-not-running.sock"),
-            internal_listen_path: temp.path().join("manager.sock"),
-            service_expected_uid: Some(994),
+            socket_path: crate::config::model::MaskingConfig::test_endpoint_path(
+                &temp,
+                "service-not-running",
+            ),
+            internal_listen_path: crate::config::model::MaskingConfig::test_endpoint_path(
+                &temp, "manager",
+            ),
             ..Default::default()
         };
+        masking.set_test_service_identity(false);
         let config = Arc::new(AppConfig {
             work_path: PathBuf::from(temp.path()),
             mcp: McpConfig::default(),

@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,8 +8,8 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::net::UnixStream;
 
+use crate::local_ipc::{self, Endpoint, Peer};
 use crate::session_manager::protocol::ToolCallResult;
 
 const MAX_INTERNAL_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -151,22 +150,28 @@ pub enum ClientError {
     },
 }
 
-/// Typed HTTP/1.1 client over a Unix domain socket.
+/// Typed HTTP/1.1 client over `local_ipc` (Unix socket on Linux, named pipe on Windows).
 #[derive(Debug, Clone)]
 pub struct MaskingServiceClient {
-    socket_path: PathBuf,
+    endpoint: Endpoint,
+    /// Ожидаемая сторона-сервер; `None` — сервер не проверяется (Linux, как раньше).
+    server: Option<Peer>,
     preflight_timeout: Duration,
     finalize_timeout: Duration,
 }
 
 impl MaskingServiceClient {
+    /// `server`: кого считать службой; на Linux менеджер службу не проверяет (`None`),
+    /// на Windows передаётся `Some` (SID и `.exe` службы).
     pub fn new(
-        socket_path: PathBuf,
+        endpoint: Endpoint,
+        server: Option<Peer>,
         preflight_timeout: Duration,
         finalize_timeout: Duration,
     ) -> Self {
         Self {
-            socket_path,
+            endpoint,
+            server,
             preflight_timeout,
             finalize_timeout,
         }
@@ -191,7 +196,8 @@ impl MaskingServiceClient {
         let body = serialize_finalize_request(request)?;
         let attempt = async {
             match request_json(
-                &self.socket_path,
+                &self.endpoint,
+                self.server.as_ref(),
                 hyper::Method::POST,
                 "/internal/v1/calls/finalize",
                 body.clone(),
@@ -200,7 +206,8 @@ impl MaskingServiceClient {
             {
                 Err(ClientError::Transport) => {
                     request_json(
-                        &self.socket_path,
+                        &self.endpoint,
+                self.server.as_ref(),
                         hyper::Method::POST,
                         "/internal/v1/calls/finalize",
                         body,
@@ -222,7 +229,8 @@ impl MaskingServiceClient {
         let body = serde_json::to_vec(request).map_err(|_| ClientError::InvalidResponse)?;
         let attempt = async {
             match request_json(
-                &self.socket_path,
+                &self.endpoint,
+                self.server.as_ref(),
                 hyper::Method::POST,
                 "/internal/v1/calls/terminal",
                 body.clone(),
@@ -231,7 +239,8 @@ impl MaskingServiceClient {
             {
                 Err(ClientError::Transport) => {
                     request_json(
-                        &self.socket_path,
+                        &self.endpoint,
+                self.server.as_ref(),
                         hyper::Method::POST,
                         "/internal/v1/calls/terminal",
                         body,
@@ -263,7 +272,8 @@ impl MaskingServiceClient {
             "/internal/v1/setup/export?database_id={database_id}&include_tools={}",
             u8::from(include_tools)
         );
-        let future = request_json(&self.socket_path, hyper::Method::GET, &path, Vec::new());
+        let future = request_json(&self.endpoint,
+                self.server.as_ref(), hyper::Method::GET, &path, Vec::new());
         tokio::time::timeout(self.preflight_timeout, future)
             .await
             .map_err(|_| ClientError::Timeout)?
@@ -276,7 +286,8 @@ impl MaskingServiceClient {
         R: DeserializeOwned,
     {
         let body = serde_json::to_vec(payload).map_err(|_| ClientError::InvalidResponse)?;
-        let future = request_json(&self.socket_path, hyper::Method::POST, path, body);
+        let future = request_json(&self.endpoint,
+                self.server.as_ref(), hyper::Method::POST, path, body);
         match tokio::time::timeout(timeout, future).await {
             Ok(result) => result,
             Err(_) => Err(ClientError::Timeout),
@@ -317,7 +328,8 @@ fn serialize_finalize_request(request: &FinalizeRequest) -> Result<Vec<u8>, Clie
 }
 
 async fn request_json<R: DeserializeOwned>(
-    socket_path: &Path,
+    endpoint: &Endpoint,
+    server: Option<&Peer>,
     method: hyper::Method,
     path: &str,
     body: Vec<u8>,
@@ -325,7 +337,9 @@ async fn request_json<R: DeserializeOwned>(
     if body.len() > MAX_INTERNAL_BODY_BYTES {
         return Err(ClientError::InvalidResponse);
     }
-    let stream = UnixStream::connect(socket_path)
+    // Недоступность службы и недоверенный сервер для вызывающего одинаково означают
+    // отказ транспорта (fail-closed); причину фиксирует журнал `local_ipc`.
+    let stream = local_ipc::connect(endpoint, server)
         .await
         .map_err(|_| ClientError::Transport)?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))

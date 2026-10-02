@@ -1,12 +1,13 @@
 //! Изолированная проверка wire-контракта manager ↔ masking-service.
 //!
-//! Тест намеренно ignored: вызывающая сторона должна передать UDS временного
+//! Тест намеренно ignored: вызывающая сторона должна передать адрес временного
 //! экземпляра сервиса с подготовленными database/job fixture.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::json;
+use v8_session_manager::local_ipc::{Endpoint, Peer};
 use v8_session_manager::session_manager::masking::client::{
     ClientError, FinalizeOutcome, FinalizeRequest, MaskingServiceClient, PreflightRequest,
 };
@@ -16,15 +17,37 @@ const CONFIGURED_CLUSTER_GUID: &str = "123e4567-e89b-12d3-a456-426614174001";
 const CONFIGURED_INFOBASE_GUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const UNKNOWN_INFOBASE_GUID: &str = "123e4567-e89b-12d3-a456-426614174099";
 
+/// Адрес службы: Linux — путь сокета, Windows — локальное имя канала вида `\\.\pipe\<имя>`.
+/// Вход `MASKING_CONTRACT_SOCKET` сохранён; на Windows дополнительно нужен
+/// `MASKING_CONTRACT_SERVICE_EXE` (полный путь `.exe` службы), `MASKING_CONTRACT_SERVICE_SID`
+/// необязателен (по умолчанию SID текущего процесса).
 fn contract_client() -> MaskingServiceClient {
     let socket = std::env::var_os("MASKING_CONTRACT_SOCKET")
         .map(PathBuf::from)
-        .expect("MASKING_CONTRACT_SOCKET must point to the isolated service UDS");
-    MaskingServiceClient::new(socket, Duration::from_secs(3), Duration::from_secs(15))
+        .expect("MASKING_CONTRACT_SOCKET must point to the isolated service address");
+    let endpoint = Endpoint::parse(&socket).expect("MASKING_CONTRACT_SOCKET is not a valid address");
+    MaskingServiceClient::new(
+        endpoint,
+        contract_server_peer(),
+        Duration::from_secs(3),
+        Duration::from_secs(15),
+    )
+}
+
+/// Linux: менеджер службу не проверяет. Windows: SID и `.exe` службы из окружения.
+fn contract_server_peer() -> Option<Peer> {
+    if cfg!(not(windows)) {
+        return None;
+    }
+    let exe = std::env::var_os("MASKING_CONTRACT_SERVICE_EXE")
+        .map(PathBuf::from)
+        .expect("MASKING_CONTRACT_SERVICE_EXE must name the service .exe on Windows");
+    let sid = std::env::var("MASKING_CONTRACT_SERVICE_SID").ok();
+    Some(Peer::from_config(None, sid.as_deref(), Some(&exe)).expect("invalid service identity"))
 }
 
 #[tokio::test]
-#[ignore = "requires an isolated masking-service UDS and seeded temporary SQLite fixture"]
+#[ignore = "requires an isolated masking-service address and seeded temporary SQLite fixture"]
 async fn isolated_masking_service_wire_contract() {
     let client = contract_client();
 

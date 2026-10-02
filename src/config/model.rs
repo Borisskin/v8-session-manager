@@ -69,6 +69,12 @@ pub struct MaskingConfig {
     /// Ожидаемый UID сервиса маскирования на `internal_listen_path`;
     /// обязателен при `enabled=true`.
     pub service_expected_uid: Option<u32>,
+    /// Windows: SID учётной записи службы маскирования. Необязателен: если не
+    /// задан, берётся SID текущего процесса. На Linux задавать нельзя.
+    pub service_expected_sid: Option<String>,
+    /// Windows: полный путь к `.exe` службы маскирования; обязателен при
+    /// `enabled=true`, значения по умолчанию нет. На Linux задавать нельзя.
+    pub service_expected_exe: Option<PathBuf>,
     //++agent TASK-225 [26.09.2026] N: `identity_bindings` (имя сессии →
     // database_id сервиса) удалено из модели — идентичность базы
     // детерминированно определяется парой (GUID кластера, GUID ИБ),
@@ -83,8 +89,8 @@ impl Default for MaskingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: PathBuf::from("/run/1c-masking/internal.sock"),
-            internal_listen_path: PathBuf::from("/run/1c-masking/manager.sock"),
+            socket_path: default_socket_path(),
+            internal_listen_path: default_internal_listen_path(),
             preflight_timeout_ms: 3_000,
             finalize_timeout_ms: 15_000,
             internal_call_timeout_ms: 10_000,
@@ -98,6 +104,76 @@ impl Default for MaskingConfig {
                 "mcp_internal_masking_dictionary_feed".to_owned(),
             ],
             service_expected_uid: None,
+            service_expected_sid: None,
+            service_expected_exe: None,
+        }
+    }
+}
+
+/// Адрес службы маскирования по умолчанию: сокет в Linux, имя канала в Windows.
+fn default_socket_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\pipe\1c-masking-service")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/run/1c-masking/internal.sock")
+    }
+}
+
+/// Адрес приёма вызовов службы менеджером по умолчанию.
+fn default_internal_listen_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\pipe\1c-masking-manager")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/run/1c-masking/manager.sock")
+    }
+}
+
+#[cfg(test)]
+impl MaskingConfig {
+    /// Тестовая идентичность службы для текущей ОС: Linux — UID владельца
+    /// свежего временного каталога (то есть собственный), Windows — `.exe`
+    /// текущего процесса. `wrong=true` даёт идентичность, не подходящую этому
+    /// процессу (UID+1000 либо другой `.exe`).
+    pub(crate) fn set_test_service_identity(&mut self, wrong: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = tempfile::tempdir().unwrap().path().metadata().unwrap().uid();
+            self.service_expected_uid = Some(if wrong { uid + 1_000 } else { uid });
+        }
+        #[cfg(windows)]
+        {
+            self.service_expected_exe = Some(if wrong {
+                PathBuf::from(r"C:\Windows\System32\cmd.exe")
+            } else {
+                std::env::current_exe().unwrap()
+            });
+        }
+    }
+
+    /// Адрес стенда: Unix — файл во временном каталоге, Windows — уникальное
+    /// имя канала. Единственная платформенная функция адреса в тестах.
+    pub(crate) fn test_endpoint_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            dir.path().join(format!("{name}.sock"))
+        }
+        #[cfg(windows)]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let _ = dir;
+            PathBuf::from(format!(
+                r"\\.\pipe\v8sm-test-{name}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
         }
     }
 }

@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::model::MaskingConfig;
+use crate::local_ipc::{Endpoint, Peer};
 use crate::session_manager::masking::client::{
     ClientError, FinalizeOutcome, FinalizeRequest, MaskingServiceClient, PreflightRequest,
     TerminalRequest, TerminalScope,
@@ -333,8 +334,9 @@ pub struct MaskingGate {
     terminal_outbox: Option<Arc<AsyncMutex<TerminalOutbox>>>,
     /// UDS-listener вызовов сервис → менеджер (`POST /internal/v1/tools/call`).
     internal_listen_path: PathBuf,
-    /// Ожидаемый UID сервиса на `internal_listen_path` (peer-cred gate).
-    service_expected_uid: Option<u32>,
+    /// Ожидаемая сторона-служба (UID в Linux, SID и `.exe` в Windows): допуск на
+    /// `internal_listen_path`. `None` — gate выключен.
+    service_peer: Option<Peer>,
     /// Дедлайн одного internal tool.call.
     internal_call_timeout: Duration,
 }
@@ -349,10 +351,13 @@ impl MaskingGate {
                 client: None,
                 terminal_outbox: None,
                 internal_listen_path: config.internal_listen_path.clone(),
-                service_expected_uid: config.service_expected_uid,
+                service_peer: None,
                 internal_call_timeout: Duration::from_millis(config.internal_call_timeout_ms),
             });
         }
+        let endpoint = Endpoint::parse(&config.socket_path)
+            .map_err(|_| "masking.socket_path is not a valid local address".to_owned())?;
+        let service_peer = crate::config::validate::service_peer(config).map_err(|err| err.to_string())?;
         //++agent TASK-225 [25.09.2026]
         // managed_tools устарел и на маршрут не влияет: все публичные
         // proxy-вызовы идут через gate; непустое значение — deprecation
@@ -368,7 +373,9 @@ impl MaskingGate {
             internal_tools: Arc::new(config.internal_tools.iter().cloned().collect()),
             ras: Some(Arc::new(RasResolver::from_env())),
             client: Some(MaskingServiceClient::new(
-                config.socket_path.clone(),
+                endpoint,
+                // Linux: менеджер службу не проверяет (как раньше); Windows: SID и `.exe`.
+                cfg!(windows).then(|| service_peer.clone()),
                 Duration::from_millis(config.preflight_timeout_ms),
                 Duration::from_millis(config.finalize_timeout_ms),
             )),
@@ -376,7 +383,7 @@ impl MaskingGate {
                 work_path.join(TERMINAL_OUTBOX_FILE),
             )?))),
             internal_listen_path: config.internal_listen_path.clone(),
-            service_expected_uid: config.service_expected_uid,
+            service_peer: Some(service_peer),
             internal_call_timeout: Duration::from_millis(config.internal_call_timeout_ms),
         })
     }
@@ -406,8 +413,9 @@ impl MaskingGate {
         &self.internal_listen_path
     }
 
-    pub(crate) fn service_expected_uid(&self) -> Option<u32> {
-        self.service_expected_uid
+    /// Ожидаемая служба на `internal_listen_path`; `None` при выключенном gate.
+    pub(crate) fn service_peer(&self) -> Option<&Peer> {
+        self.service_peer.as_ref()
     }
 
     pub(crate) fn internal_call_timeout(&self) -> Duration {
@@ -754,10 +762,26 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use serde_json::json;
     use std::convert::Infallible;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::local_ipc::{Access, Listener};
     use std::sync::Mutex;
     use std::time::Instant;
-    use tokio::net::UnixListener;
+
+    /// Файл очереди доступен только владельцу (Unix: режим `0600`; в Windows права каталога
+    /// данных не меняются, проверять нечего).
+    fn assert_private_file(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    fn bind_test_listener(path: &Path) -> Listener {
+        let endpoint = Endpoint::parse(path).unwrap();
+        Listener::bind(&endpoint, Access::default()).unwrap()
+    }
 
     const TEST_CLUSTER: &str = "0de031da-e8d9-43de-bb39-7c8bd4d9855c";
     const TEST_INFOBASE: &str = "320f6387-89b5-43fc-b344-67b11f957472";
@@ -774,10 +798,11 @@ mod tests {
 
     fn gate() -> MaskingGate {
         let dir = tempfile::tempdir().unwrap();
-        let config = MaskingConfig {
+        let mut config = MaskingConfig {
             enabled: true,
             ..MaskingConfig::default()
         };
+        config.set_test_service_identity(false);
         MaskingGate::from_config(&config, dir.path()).unwrap()
     }
 
@@ -998,10 +1023,7 @@ mod tests {
         outbox.enqueue(event.clone()).unwrap();
         outbox.enqueue(event.clone()).unwrap();
         assert_eq!(outbox.events.len(), 1);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_private_file(&path);
 
         let restored = TerminalOutbox::load(path.clone()).unwrap();
         assert_eq!(restored.events, vec![event.clone()]);
@@ -1086,13 +1108,14 @@ mod tests {
     #[tokio::test]
     async fn terminal_outbox_survives_restart_and_replays_only_safe_wire() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("masking.sock");
-        let config = MaskingConfig {
+        let socket_path = MaskingConfig::test_endpoint_path(&dir, "masking");
+        let mut config = MaskingConfig {
             enabled: true,
             socket_path: socket_path.clone(),
             preflight_timeout_ms: 100,
             ..MaskingConfig::default()
         };
+        config.set_test_service_identity(false);
         let event = TerminalRequest {
             schema_version: 1,
             call_id: Uuid::new_v4().to_string(),
@@ -1106,7 +1129,7 @@ mod tests {
         gate.record_terminal(event.clone()).await.unwrap();
         drop(gate);
 
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let mut listener = bind_test_listener(&socket_path);
         let (wire_tx, wire_rx) = tokio::sync::oneshot::channel();
         let wire_tx = Arc::new(Mutex::new(Some(wire_tx)));
         let server = tokio::spawn({
@@ -1160,13 +1183,14 @@ mod tests {
     #[tokio::test]
     async fn finalize_transport_failure_persists_only_safe_terminal_event() {
         let dir = tempfile::tempdir().unwrap();
-        let config = MaskingConfig {
+        let mut config = MaskingConfig {
             enabled: true,
-            socket_path: dir.path().join("service-not-running.sock"),
+            socket_path: MaskingConfig::test_endpoint_path(&dir, "service-not-running"),
             preflight_timeout_ms: 100,
             finalize_timeout_ms: 100,
             ..MaskingConfig::default()
         };
+        config.set_test_service_identity(false);
         let gate = MaskingGate::from_config(&config, dir.path()).unwrap();
         let context = MaskingCallContext {
             call_id: Uuid::new_v4().to_string(),
@@ -1211,13 +1235,14 @@ mod tests {
     #[tokio::test]
     async fn preflight_service_not_ready_is_recorded_through_terminal_route() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("masking.sock");
-        let config = MaskingConfig {
+        let socket_path = MaskingConfig::test_endpoint_path(&dir, "masking");
+        let mut config = MaskingConfig {
             enabled: true,
             socket_path: socket_path.clone(),
             preflight_timeout_ms: 500,
             ..MaskingConfig::default()
         };
+        config.set_test_service_identity(false);
         let context = MaskingCallContext {
             call_id: Uuid::new_v4().to_string(),
             correlation_id: Uuid::new_v4().to_string(),
@@ -1226,7 +1251,7 @@ mod tests {
             tool_name: "execute_query".to_owned(),
         };
 
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let mut listener = bind_test_listener(&socket_path);
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let terminal_tx = Arc::new(Mutex::new(Some(terminal_tx)));
         let correlation_id = context.correlation_id.clone();

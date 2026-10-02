@@ -4,6 +4,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::model::AppConfig;
+use crate::local_ipc::{ConfigError, Endpoint, Peer};
 
 #[derive(Debug, Error)]
 pub enum ConfigValidationError {
@@ -28,10 +29,10 @@ pub enum ConfigValidationError {
     #[error("tools_cache.cache_life_period must be >= 1s (got {0:?})")]
     ToolsCacheLifePeriodTooSmall(Duration),
 
-    #[error("masking.socket_path must be an absolute non-empty path")]
+    #[error("masking.socket_path is not a valid local address for this OS")]
     InvalidMaskingSocketPath,
 
-    #[error("masking.internal_listen_path must be an absolute non-empty path")]
+    #[error("masking.internal_listen_path is not a valid local address for this OS")]
     InvalidMaskingInternalListenPath,
 
     #[error("masking.{0} must be greater than zero")]
@@ -42,6 +43,13 @@ pub enum ConfigValidationError {
 
     #[error("masking.service_expected_uid is required when masking is enabled")]
     MissingServiceExpectedUid,
+
+    /// Параметр идентичности службы не подходит этой ОС или недопустим; значение не выводится.
+    #[error("masking.service_expected_{field} {reason}")]
+    InvalidServiceIdentity {
+        field: &'static str,
+        reason: &'static str,
+    },
     //++agent TASK-225 [26.09.2026] N: `identity_bindings` и YAML-настройки
     // RAS удалены — маршрут по (GUID кластера, GUID ИБ), RAS-резолюция
     // конфигурируется env (см. masking::ras), пустой/отсутствующий RAS —
@@ -92,14 +100,10 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigValidationError> {
     }
 
     if config.masking.enabled {
-        if config.masking.socket_path.as_os_str().is_empty()
-            || !config.masking.socket_path.is_absolute()
-        {
+        if Endpoint::parse(&config.masking.socket_path).is_err() {
             return Err(ConfigValidationError::InvalidMaskingSocketPath);
         }
-        if config.masking.internal_listen_path.as_os_str().is_empty()
-            || !config.masking.internal_listen_path.is_absolute()
-        {
+        if Endpoint::parse(&config.masking.internal_listen_path).is_err() {
             return Err(ConfigValidationError::InvalidMaskingInternalListenPath);
         }
         if config.masking.preflight_timeout_ms == 0 {
@@ -132,18 +136,51 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigValidationError> {
         {
             return Err(ConfigValidationError::InvalidInternalTools);
         }
-        if config.masking.service_expected_uid.is_none() {
-            return Err(ConfigValidationError::MissingServiceExpectedUid);
-        }
+        service_peer(&config.masking)?;
     }
 
     Ok(())
 }
 
+/// Строит ожидаемого пира службы из конфигурации (`Peer::from_config`); ошибки `local_ipc`
+/// превращаются в ошибки конфигурации с именем параметра и причиной, без значения.
+pub(crate) fn service_peer(
+    masking: &crate::config::model::MaskingConfig,
+) -> Result<Peer, ConfigValidationError> {
+    Peer::from_config(
+        masking.service_expected_uid,
+        masking.service_expected_sid.as_deref(),
+        masking.service_expected_exe.as_deref(),
+    )
+    .map_err(|err| match err {
+        ConfigError::Missing { field: "uid" } => ConfigValidationError::MissingServiceExpectedUid,
+        ConfigError::Missing { field } => ConfigValidationError::InvalidServiceIdentity {
+            field: identity_field(field),
+            reason: "is required on this OS",
+        },
+        ConfigError::Unsupported { field } => ConfigValidationError::InvalidServiceIdentity {
+            field: identity_field(field),
+            reason: "is not supported on this OS",
+        },
+        ConfigError::Invalid { field } => ConfigValidationError::InvalidServiceIdentity {
+            field: identity_field(field),
+            reason: "has an invalid value",
+        },
+    })
+}
+
+fn identity_field(field: &str) -> &'static str {
+    match field {
+        "uid" => "uid",
+        "sid" => "sid",
+        _ => "exe",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{AppConfig, McpConfig, ToolsCacheConfig};
+    use crate::config::model::{AppConfig, MaskingConfig, McpConfig, ToolsCacheConfig};
     use std::path::PathBuf;
 
     fn base_config() -> AppConfig {
@@ -194,17 +231,59 @@ mod tests {
     fn masking_enabled_requires_service_uid() {
         let mut cfg = base_config();
         cfg.masking.enabled = true;
-        cfg.masking.socket_path = PathBuf::from("/run/mask.sock");
-        cfg.masking.internal_listen_path = PathBuf::from("/run/mask-manager.sock");
+        let dir = tempfile::tempdir().unwrap();
+        cfg.masking.socket_path = MaskingConfig::test_endpoint_path(&dir, "mask");
+        cfg.masking.internal_listen_path = MaskingConfig::test_endpoint_path(&dir, "mask-manager");
         // TASK-225/N: identity_bindings удалены — маршрут по координатам
         // кластера (cluster_server + RAS-резолвленные GUID-ы), YAML-привязок
         // и RAS-конфига больше нет: RAS задаётся env и опционален.
+        // Идентичность службы не задана: Linux — прежняя ошибка про UID, Windows — про exe.
+        let err = validate(&cfg).unwrap_err();
+        #[cfg(unix)]
+        assert!(matches!(err, ConfigValidationError::MissingServiceExpectedUid));
+        #[cfg(windows)]
         assert!(matches!(
-            validate(&cfg),
-            Err(ConfigValidationError::MissingServiceExpectedUid)
+            err,
+            ConfigValidationError::InvalidServiceIdentity { field: "exe", .. }
         ));
 
-        cfg.masking.service_expected_uid = Some(994);
+        cfg.masking.set_test_service_identity(false);
         assert!(validate(&cfg).is_ok());
+    }
+
+    /// Поле чужой ОС отвергается с именем параметра и без значения.
+    #[test]
+    fn masking_rejects_foreign_os_identity_field() {
+        let mut cfg = base_config();
+        cfg.masking.enabled = true;
+        cfg.masking.set_test_service_identity(false);
+        #[cfg(unix)]
+        {
+            cfg.masking.service_expected_exe = Some(PathBuf::from("/secret/service.exe"));
+        }
+        #[cfg(windows)]
+        {
+            cfg.masking.service_expected_uid = Some(994);
+        }
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidServiceIdentity { .. }
+        ));
+        let text = err.to_string();
+        assert!(text.contains("masking.service_expected_"), "{text}");
+        assert!(!text.contains("secret") && !text.contains("994"), "{text}");
+    }
+
+    #[test]
+    fn masking_rejects_invalid_endpoint() {
+        let mut cfg = base_config();
+        cfg.masking.enabled = true;
+        cfg.masking.set_test_service_identity(false);
+        cfg.masking.socket_path = PathBuf::from("relative-address");
+        assert!(matches!(
+            validate(&cfg),
+            Err(ConfigValidationError::InvalidMaskingSocketPath)
+        ));
     }
 }

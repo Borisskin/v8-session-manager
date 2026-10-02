@@ -1,10 +1,11 @@
-//! Internal UDS endpoint для вызовов сервиса маскирования → менеджер.
+//! Internal endpoint (Unix-сокет в Linux, именованный канал в Windows) для вызовов сервиса маскирования → менеджер.
 //!
 //! Контракт (см. TASK-222, N из TASK-225): единственный метод
 //! `POST /internal/v1/tools/call` на `masking.internal_listen_path` в том же
-//! shared volume, что и `service.sock`. Доступ ограничен peer UID равным
-//! `masking.service_expected_uid` — сокет лежит рядом с сокетом сервиса, а
-//! peer creds гарантируют, что caller именно сервис.
+//! shared volume, что и `service.sock`. Доступ ограничен ожидаемой службой
+//! (`local_ipc::Peer`: Linux — peer UID `masking.service_expected_uid`; Windows —
+//! SID `masking.service_expected_sid` в списке доступа канала), а `PeerInfo.authorized`
+//! гарантирует, что caller именно сервис.
 //!
 //! Тело запроса — `{"instance_id","name","arguments"}`: точный ключ базы
 //! (`ras:<c>:<i>`/`gen:<srvr>/<ref>`), тот же что `databases.instance_id`
@@ -24,10 +25,10 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+use crate::local_ipc::{Access, Endpoint, Listener, Stream};
 use crate::session_manager::masking::MaskingGate;
 use crate::session_manager::protocol::{ToolCallParams, ToolCallResult, ToolVisibility};
 use crate::session_manager::registry::{SessionRegistry, SessionState};
@@ -129,8 +130,8 @@ struct InternalEndpointContext {
     call_timeout: Duration,
 }
 
-/// Поднимает internal UDS endpoint при `masking.enabled=true`.
-/// `None` — gate выключен либо `service_expected_uid` не задан (последнее
+/// Поднимает internal endpoint при `masking.enabled=true`.
+/// `None` — gate выключен либо ожидаемая служба не задана (последнее
 /// невозможно после валидации конфига; защитный fail-closed).
 pub fn spawn_internal_endpoint(
     gate: Arc<MaskingGate>,
@@ -140,13 +141,24 @@ pub fn spawn_internal_endpoint(
     if !gate.is_enabled() {
         return None;
     }
-    let expected_uid = gate.service_expected_uid()?;
+    let service_peer = gate.service_peer()?.clone();
     let path = gate.internal_listen_path().to_path_buf();
     let internal_tools = Arc::new(gate.internal_tools().clone());
     let call_timeout = gate.internal_call_timeout();
     Some(tokio::spawn(async move {
-        let _ = std::fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
+        let endpoint = match Endpoint::parse(&path) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                error!(?err, path = %path.display(), "masking internal endpoint address invalid");
+                return;
+            }
+        };
+        // Права по umask (как раньше); допуск — только ожидаемая служба.
+        let access = Access {
+            unix_mode: None,
+            allow: Some(service_peer),
+        };
+        let mut listener = match Listener::bind(&endpoint, access) {
             Ok(listener) => listener,
             Err(err) => {
                 error!(?err, path = %path.display(), "masking internal endpoint bind failed");
@@ -163,24 +175,21 @@ pub fn spawn_internal_endpoint(
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else {
+                    let Ok((stream, info)) = accepted else {
                         continue;
                     };
-                    let authorized = stream
-                        .peer_cred()
-                        .map(|cred| cred.uid() == expected_uid)
-                        .unwrap_or(false);
+                    let authorized = info.authorized;
                     let mut conn_ctx = context.clone();
                     conn_ctx.authorized = authorized;
                     tokio::spawn(serve_connection(stream, conn_ctx));
                 }
             }
         }
-        let _ = std::fs::remove_file(&path);
+        listener.close();
     }))
 }
 
-async fn serve_connection(stream: UnixStream, context: InternalEndpointContext) {
+async fn serve_connection(stream: Stream, context: InternalEndpointContext) {
     let service = service_fn(move |request: Request<hyper::body::Incoming>| {
         let context = context.clone();
         async move { handle_request(request, context).await }
@@ -264,27 +273,25 @@ mod tests {
     const CLUSTER: &str = "0de031da-e8d9-43de-bb39-7c8bd4d9855c";
     const INFOBASE: &str = "320f6387-89b5-43fc-b344-67b11f957472";
 
-    fn own_uid() -> u32 {
-        let (a, _b) = UnixStream::pair().unwrap();
-        a.peer_cred().unwrap().uid()
-    }
-
     fn ras_key() -> String {
         format!("ras:{CLUSTER}:{INFOBASE}")
     }
 
     /// Enabled gate с tempdir-сокетами; маршрут — только по точному ключу
     /// из регистрации.
-    fn gate_fixture(dir: &tempfile::TempDir, expected_uid: u32) -> Arc<MaskingGate> {
-        let config = MaskingConfig {
+    /// `wrong_peer=true` — ожидаемая служба не совпадает с этим процессом
+    /// (Unix: UID+1000, Windows: другой `.exe`). Возвращает gate и адрес приёма.
+    fn gate_fixture(dir: &tempfile::TempDir, wrong_peer: bool) -> (Arc<MaskingGate>, PathBuf) {
+        let listen = MaskingConfig::test_endpoint_path(dir, "manager");
+        let mut config = MaskingConfig {
             enabled: true,
-            socket_path: dir.path().join("service.sock"),
-            internal_listen_path: dir.path().join("manager.sock"),
+            socket_path: MaskingConfig::test_endpoint_path(dir, "service"),
+            internal_listen_path: listen.clone(),
             internal_call_timeout_ms: 2_000,
-            service_expected_uid: Some(expected_uid),
             ..MaskingConfig::default()
         };
-        Arc::new(MaskingGate::from_config(&config, dir.path()).unwrap())
+        config.set_test_service_identity(wrong_peer);
+        (Arc::new(MaskingGate::from_config(&config, dir.path()).unwrap()), listen)
     }
 
     fn internal_tool() -> ToolDescriptor {
@@ -332,8 +339,9 @@ mod tests {
     }
 
     /// Сырой HTTP POST по UDS: `Connection: close` даёт EOF после ответа.
-    async fn http_post(socket: &PathBuf, body: &[u8]) -> (u16, Value) {
-        let mut stream = UnixStream::connect(socket).await.unwrap();
+    async fn http_post(socket: &std::path::Path, body: &[u8]) -> (u16, Value) {
+        let endpoint = Endpoint::parse(socket).unwrap();
+        let mut stream = crate::local_ipc::connect(&endpoint, None).await.unwrap();
         let request = format!(
             "POST /internal/v1/tools/call HTTP/1.1\r\nHost: mgr\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -514,12 +522,12 @@ mod tests {
         );
 
         // Peer UID чужой — каждый запрос отклоняется forbidden до проверки пути.
-        let gate = gate_fixture(&dir, own_uid() + 1_000);
+        let (gate, listen) = gate_fixture(&dir, true);
         let shutdown = CancellationToken::new();
         let task = spawn_internal_endpoint(gate, Arc::clone(&registry), shutdown.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (status, body) = http_post(
-            &dir.path().join("manager.sock"),
+            &listen,
             call_body(&ras_key(), METADATA_TOOL).as_bytes(),
         )
         .await;
@@ -531,12 +539,12 @@ mod tests {
 
         // Свой UID, но имя вне masking.internal_tools → method_not_found.
         let dir2 = tempfile::tempdir().unwrap();
-        let gate = gate_fixture(&dir2, own_uid());
+        let (gate, listen2) = gate_fixture(&dir2, false);
         let shutdown = CancellationToken::new();
         let task = spawn_internal_endpoint(gate, Arc::clone(&registry), shutdown.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (status, body) = http_post(
-            &dir2.path().join("manager.sock"),
+            &listen2,
             call_body(&ras_key(), "execute_query").as_bytes(),
         )
         .await;
@@ -545,7 +553,7 @@ mod tests {
 
         // Невалидный JSON → invalid_request (serde до маршрутизации).
         let (status, body) = http_post(
-            &dir2.path().join("manager.sock"),
+            &listen2,
             br#"{"instance_id":123,"name":"x"}"#,
         )
         .await;
@@ -555,7 +563,7 @@ mod tests {
         // Ключ без активной сессии (база существует в сервисе, но 1С не
         // подключена) → no_target.
         let (status, body) = http_post(
-            &dir2.path().join("manager.sock"),
+            &listen2,
             call_body(
                 &format!("ras:{CLUSTER}:{}", uuid::Uuid::new_v4()),
                 METADATA_TOOL,
@@ -585,7 +593,7 @@ mod tests {
             Some(Arc::clone(&connection)),
         );
 
-        let gate = gate_fixture(&dir, own_uid());
+        let (gate, listen) = gate_fixture(&dir, false);
         let shutdown = CancellationToken::new();
         let task = spawn_internal_endpoint(gate, Arc::clone(&registry), shutdown.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -609,7 +617,7 @@ mod tests {
         });
 
         let (status, body) = http_post(
-            &dir.path().join("manager.sock"),
+            &listen,
             format!(
                 r#"{{"instance_id":"{}","name":"{METADATA_TOOL}","arguments":{{"selector":{{}},"cursor":null}}}}"#,
                 ras_key()
