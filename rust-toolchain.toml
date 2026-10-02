@@ -1,0 +1,7 @@
+# Версия Rust закреплена: сборки в CI, в Docker и у разработчиков идут на одной и той же версии.
+# Менять версию — осознанно и сразу везде: здесь, в .github/workflows (dtolnay/rust-toolchain@<версия>)
+# и в Dockerfile (если есть). Проверено на 1.98.1.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
