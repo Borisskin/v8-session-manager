@@ -168,40 +168,63 @@ async fn client_abort_mid_request_does_not_break_listener() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sixty_four_parallel_connections() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     const N: usize = 64;
     let t = test_endpoint();
     let mut listener = bind(&t.endpoint);
-    let server = tokio::spawn(async move {
-        let mut handlers = Vec::new();
-        for _ in 0..N {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handlers.push(tokio::spawn(async move {
-                let mut byte = [0u8; 1];
-                stream.read_exact(&mut byte).await.unwrap();
-                stream.write_all(&byte).await.unwrap();
-                stream.flush().await.unwrap();
-            }));
-        }
-        for handler in handlers {
-            handler.await.unwrap();
+    // Счётчики стадий: при зависании в сообщении видно, где остановились.
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let accepted = accepted.clone();
+        async move {
+            let mut handlers = Vec::new();
+            for _ in 0..N {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::Relaxed);
+                handlers.push(tokio::spawn(async move {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    stream.write_all(&byte).await.unwrap();
+                    stream.flush().await.unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
         }
     });
     let mut clients = Vec::new();
     for i in 0..N {
         let endpoint = t.endpoint.clone();
+        let (connected, answered) = (connected.clone(), answered.clone());
         clients.push(tokio::spawn(async move {
             let mut stream = connect(&endpoint, None).await.expect("подключение отвергнуто");
+            connected.fetch_add(1, Ordering::Relaxed);
             stream.write_all(&[i as u8]).await.unwrap();
             stream.flush().await.unwrap();
             let mut back = [0u8; 1];
             stream.read_exact(&mut back).await.unwrap();
             assert_eq!(back[0], i as u8);
+            answered.fetch_add(1, Ordering::Relaxed);
         }));
     }
-    for client in clients {
-        client.await.unwrap();
+    let all = async {
+        for client in clients {
+            client.await.unwrap();
+        }
+        server.await.unwrap();
+    };
+    if tokio::time::timeout(Duration::from_secs(45), all).await.is_err() {
+        panic!(
+            "64 подключений не завершились за 45 с: принято сервером {}, подключено клиентами {}, получили ответ {}",
+            accepted.load(Ordering::Relaxed),
+            connected.load(Ordering::Relaxed),
+            answered.load(Ordering::Relaxed),
+        );
     }
-    server.await.unwrap();
 }
 
 #[tokio::test]

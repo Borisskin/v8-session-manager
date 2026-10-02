@@ -25,6 +25,9 @@ use super::{policy, Access, ConnectError, Endpoint, Peer, PeerInfo};
 /// канала с этим именем уже существует.
 const ERROR_ACCESS_DENIED: i32 = 5;
 
+/// Предельное время подключения к каналу, включая ожидание свободного экземпляра.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Двунаправленный поток соединения.
 #[derive(Debug)]
 pub struct Stream(PipeStream);
@@ -117,7 +120,11 @@ impl Listener {
 /// Подключение. `server: Some(peer)` — SID владельца и файл `.exe` процесса сервера обязаны
 /// совпасть, иначе [`ConnectError::Untrusted`]; невозможность проверить тоже отказ.
 pub async fn connect(endpoint: &Endpoint, server: Option<&Peer>) -> Result<Stream, ConnectError> {
-    let stream = PipeStream::connect(pipe_name(endpoint)?).await?;
+    // `interprocess` при занятом канале ждёт свободный экземпляр без предела; подключение не
+    // должно висеть вечно, поэтому время ожидания ограничено.
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, PipeStream::connect(pipe_name(endpoint)?))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "время подключения к каналу истекло"))??;
     if let Some(peer) = server {
         if !verify_server(&stream, peer, endpoint) {
             return Err(ConnectError::Untrusted);

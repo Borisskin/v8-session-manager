@@ -85,7 +85,7 @@ masking:
 
 $env:MASKING_DATABASE_PATH = Join-Path $WorkDir 'service.sqlite3'
 $env:MASKING_SOCKET_PATH = "\\.\pipe\$pipeService"
-$env:MASKING_CONTROL_PATH = "\\.\pipe\$pipeControl"
+$env:MASKING_CONTROL_SOCKET_PATH = "\\.\pipe\$pipeControl"
 $env:MASKING_MANAGER_SOCKET_PATH = "\\.\pipe\$pipeManager"
 $env:MASKING_MANAGER_EXE = $ManagerExe
 $env:MASKING_EXPECTED_ORIGIN = 'http://127.0.0.1:18787'
