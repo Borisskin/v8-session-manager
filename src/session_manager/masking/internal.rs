@@ -521,21 +521,26 @@ mod tests {
             None,
         );
 
-        // Peer UID чужой — каждый запрос отклоняется forbidden до проверки пути.
-        let (gate, listen) = gate_fixture(&dir, true);
-        let shutdown = CancellationToken::new();
-        let task = spawn_internal_endpoint(gate, Arc::clone(&registry), shutdown.clone()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let (status, body) = http_post(
-            &listen,
-            call_body(&ras_key(), METADATA_TOOL).as_bytes(),
-        )
-        .await;
-        assert_eq!(status, 403);
-        assert_eq!(body["error"]["code"], "forbidden");
+        // Peer UID чужой — каждый запрос отклоняется forbidden до проверки пути. В Windows
+        // доступ к каналу решает список доступа по SID, а чужую учётную запись внутри одного
+        // процесса не изобразить: там отказ проверяется вручную (приёмка, критерий Б1).
+        #[cfg(unix)]
+        {
+            let (gate, listen) = gate_fixture(&dir, true);
+            let shutdown = CancellationToken::new();
+            let task =
+                spawn_internal_endpoint(gate, Arc::clone(&registry), shutdown.clone()).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (status, body) =
+                http_post(&listen, call_body(&ras_key(), METADATA_TOOL).as_bytes()).await;
+            assert_eq!(status, 403);
+            assert_eq!(body["error"]["code"], "forbidden");
 
-        shutdown.cancel();
-        task.await.unwrap();
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = &dir;
 
         // Свой UID, но имя вне masking.internal_tools → method_not_found.
         let dir2 = tempfile::tempdir().unwrap();
