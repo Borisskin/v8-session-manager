@@ -1,0 +1,31 @@
+# Проверка на каждый push и pull request: сборка и тесты на Linux и Windows (через настоящий
+# именованный канал). Выпусков здесь нет, они в release.yml.
+# Идентичность src/local_ipc с b-1c-masking-service сторожит контрольная сумма local_ipc.sha256
+# (одна и та же в обоих репозиториях); полное сравнение (diff -r) выполняется при приёмке.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Контрольная сумма local_ipc
+        if: runner.os != 'Windows'
+        run: |
+          cd src/local_ipc
+          test "$(cat mod.rs policy.rs tests.rs unix.rs windows.rs | sha256sum | cut -d' ' -f1)" = "$(cat ../../local_ipc.sha256)"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
