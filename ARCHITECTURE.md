@@ -31,8 +31,9 @@
 | `src/session_manager/transport.rs` | WS-транспорт | axum + tokio-tungstenite на `:4000/sessions`. Принимает WS, ведёт reader/writer таски, шлёт RFC 6455 Ping для liveness, дёргает реестр на регистрацию/disconnect/reconnect. |
 | `src/session_manager/registry.rs` | `SessionRegistry` | In-memory реестр сессий: `client_uid` → `SessionRecord` (prefix, generation, tools, статус, `last_inbound_at`, `last_call_at`). Под `Arc`, шарится между транспортами. |
 | `src/session_manager/dispatcher.rs` | per-session FIFO | `SessionDispatcher` для каждой сессии: последовательная очередь tool-вызовов, inflight-счётчик, idle-bump (ADR-0021, ADR-0024). |
-| `src/session_manager/masking/` | security gate | Typed HTTP/1.1 client по UDS, проверка identity базы сессии, атрибут аудита вызывающего (`caller`), preflight до WS dispatch и atomic finalize после terminal outcome. |
-| `src/session_manager/masking/internal.rs` | internal endpoint | UDS `POST /internal/v1/tools/call` для сервиса маскирования: peer-UID gate, session→database resolution по конфигу, dispatch настроенных internal tools в 1С. |
+| `src/local_ipc/` | локальный обмен | Единственный шов Unix/Windows: `Endpoint`, `Peer`, `Access`, `Listener`, `connect`, `PeerInfo`. Linux — Unix-сокеты, Windows — именованные каналы с защищённым списком доступа и проверкой сервера по SID и `.exe`. Файлы модуля идентичны в менеджере и службе маскирования. |
+| `src/session_manager/masking/` | security gate | Typed HTTP/1.1 client по `local_ipc`, проверка identity базы сессии, атрибут аудита вызывающего (`caller`), preflight до WS dispatch и atomic finalize после terminal outcome. |
+| `src/session_manager/masking/internal.rs` | internal endpoint | `POST /internal/v1/tools/call` по `local_ipc` для сервиса маскирования: допуск по `PeerInfo.authorized` (Linux — UID, Windows — SID), session→database resolution по конфигу, dispatch настроенных internal tools в 1С. |
 | `src/session_manager/protocol.rs` | JSON-RPC 2.0 | Envelope + методы control-plane: `session.register`, `session.bye`, `tools/publish`, `tools/list_changed` (ADR-0023). |
 | `src/session_manager/lifecycle.rs` | sweepers | Idle-sweeper по `idle_timeout_secs`, grace-sweeper по `reconnection_grace_secs` для удаления отключённых записей. |
 | `src/session_manager/router.rs` | резолв префиксов | Маппинг `<prefix>__<tool>` ↔ `(session_id, tool_name)` при `tools/list` и `tools/call` (ADR-0025). |
@@ -72,10 +73,11 @@
 `public_result` сервиса. Ошибка на любом звене даёт фиксированный sanitized
 error без raw fallback.
 
-Сервис маскирования загружает словарь самостоятельно: через UDS endpoint
+Сервис маскирования загружает словарь самостоятельно: через endpoint
 `POST /internal/v1/tools/call` (`masking.internal_listen_path`) он вызывает
-настроенные internal tools адаптера 1С. Peer допускается только с UID
-`masking.service_expected_uid`; `database_id` резолвится в ровно одну
+настроенные internal tools адаптера 1С. Peer допускается только ожидаемый
+(Linux — UID `masking.service_expected_uid`, Windows — SID/`.exe` из
+`service_expected_sid`/`service_expected_exe`); `database_id` резолвится в ровно одну
 активную сессию по имени из `identity_bindings`, а запрошенный tool обязан
 быть опубликован сессией с `visibility=internal` (метку ставит менеджер по
 `masking.internal_tools`, adapter-provided visibility не доверяется).

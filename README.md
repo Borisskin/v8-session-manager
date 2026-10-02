@@ -272,7 +272,11 @@ Tool `session_list` (единственный встроенный tool мене
 | `mcp.execution.shutdown_grace_period_secs` | Grace на graceful shutdown | `30` |
 | `mcp.metrics.bind_address` | Prometheus `/metrics` (пусто = выкл.) | `127.0.0.1:9100` |
 | `masking.enabled` | Включить fail-closed внешний masking gate | `false` |
-| `masking.socket_path` | UDS внутреннего API masking service | `/run/1c-masking/internal.sock` |
+| `masking.socket_path` | Адрес службы маскирования: Linux — UDS, Windows — именованный канал | Linux `/run/1c-masking/internal.sock`, Windows `\\.\pipe\1c-masking-service` |
+| `masking.internal_listen_path` | Адрес приёма вызовов службы менеджером | Linux `/run/1c-masking/manager.sock`, Windows `\\.\pipe\1c-masking-manager` |
+| `masking.service_expected_uid` | Linux: UID службы; на Windows задавать нельзя | — |
+| `masking.service_expected_sid` | Windows: SID учётной записи службы; по умолчанию SID текущего процесса; на Linux задавать нельзя | — |
+| `masking.service_expected_exe` | Windows: полный путь к `.exe` службы; обязателен при `masking.enabled: true`, значения по умолчанию нет; на Linux задавать нельзя | — |
 
 При `masking.enabled: true` manager требует успешно завершённые
 preflight/finalize **для каждого** публичного
@@ -295,10 +299,22 @@ docs/CONFIGURATION.md; логин/пароль RAS опциональны, по 
 raw fallback отсутствует. Agent-facing параметры маскирования, history IDs
 и controls не добавляются.
 
-Сервис маскирования загружает словарь через manager-owned UDS endpoint
+Сервис маскирования загружает словарь через manager-owned endpoint
 `POST /internal/v1/tools/call` (`masking.internal_listen_path`), доступный
-только peer-у с UID `masking.service_expected_uid`; internal tools
-адаптера не попадают в agent view.
+только ожидаемой службе: на Linux peer-у с UID `masking.service_expected_uid`, на
+Windows учётной записи `masking.service_expected_sid`; internal tools
+адаптера не попадают в agent view. На Windows менеджер при обращении к службе
+проверяет SID и `.exe` службы (`masking.service_expected_exe`); на Linux службу
+не проверяет, как раньше. Сборка Windows не зависит от значения `masking.enabled`.
+
+### Windows: запуск из PowerShell (без системных служб)
+
+Допущения: машина служб недоступна агентам и посторонним; обе службы (менеджер и
+служба маскирования) работают под одной учётной записью **без прав администратора**
+на этой машине (иначе агент получит доступ к данным через `\\server\c$`);
+`masking.service_expected_exe` задаётся явно, значения по умолчанию нет.
+Пример и подробности: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#windows-именованные-каналы),
+[docs/INSTALL.md](docs/INSTALL.md#windows-запуск-из-powershell-с-маскированием).
 
 Канал регистрации предполагает доверенный VPN/LAN/tunnel между 1С и WS
 endpoint; сам `session.register` отдельной криптографической аутентификации

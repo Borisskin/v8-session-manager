@@ -124,6 +124,28 @@ mcp:
     shutdown_grace_period_secs: 30
 ```
 
+### Windows: запуск из PowerShell с маскированием
+
+Режим без системных служб Windows: оба процесса (`v8-session-manager.exe` и
+`masking-service.exe`) запускаются вручную из PowerShell под одной учётной записью.
+
+Условия:
+- машина служб недоступна агентам и посторонним; права на каталог данных не меняются;
+- учётная запись **без прав администратора** на машине служб (иначе агент получает
+  доступ к данным через `\\server\c$`);
+- один комплект на машину; параллельные экземпляры не поддерживаются;
+- `masking.service_expected_exe` задаётся явно: значения по умолчанию нет.
+
+```powershell
+# 1. Конфиг: masking.enabled=true, service_expected_exe, адреса каналов (см. docs/CONFIGURATION.md)
+# 2. Сначала служба маскирования (создаёт каналы), затем менеджер
+Start-Process -FilePath C:\masking\masking-service.exe -WindowStyle Hidden
+.\v8-session-manager.exe --config C:\ProgramData\v8-session-manager\v8sm.yaml
+```
+
+Менеджер и служба проверяют друг друга по SID и `.exe`; если порядок запуска нарушен,
+вызовы закрываются отказом (fail-closed), а не пропускаются без обезличивания.
+
 ### 3. Установка через NSSM
 
 ```text

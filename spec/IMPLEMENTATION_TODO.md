@@ -179,3 +179,16 @@
 - [x] Убрать fixture-config fallback как неявный "live" default; mandatory designer smoke теперь требует явный `V8TR_DESIGNER_REAL_CONFIG`, а soft-skip разрешается только через hook `V8TR_DESIGNER_ALLOW_MISSING_CONFIG=1`.
 - [x] Зафиксировать в `spec/REAL_ENV_TEST_PLAN.md`, что будущий GitHub Actions matrix на `ubuntu-latest` и `windows-latest` является source of truth, а `live-mcp-http` и `live-cli-ibcmd` остаются non-blocking.
 - [ ] Добавить workflow wiring для установки 1С на GitHub-hosted runner'ах, bootstrap файловой ИБ через `ibsrv`, trusted/fork gating и upload deploy-ready артефактов.
+
+## Windows: именованные каналы для службы маскирования (2026-09-30)
+
+План, спецификация и список задач лежат вне репозитория, в рабочем каталоге проекта: `docs/2026-09-30-windows-masking-services-development-plan.md`, `docs/2026-09-30-windows-masking-services-spec.md`, `docs/2026-09-30-windows-masking-services-tasks.md` (относительно `D:\chat\1cmcp`). Здесь — только задачи менеджера.
+
+- [x] T2. Модуль `src/local_ipc` (копия, идентичная репозиторию службы)
+- [x] T4. Перенос менеджера на `local_ipc`: клиент службы (`masking/client.rs`), внутренний сервер (`masking/internal.rs`, `authorized` из `PeerInfo`), gate (`service_peer()`)
+- [x] T4. Конфигурация: `service_expected_sid`, `service_expected_exe`, адреса по умолчанию по `cfg`, валидация через `Endpoint::parse` и `Peer::from_config`
+- [x] T4. Тесты `masking/internal.rs`, `masking/gate.rs`, `config`, `mcp/server.rs` и `tests/masking_service_contract.rs` без `cfg(unix)`; `MASKING_CONTRACT_SOCKET` сохранён (на Windows ещё `MASKING_CONTRACT_SERVICE_EXE`)
+- [x] Д2. `cargo check --all-targets` для `x86_64-pc-windows-gnu` проходит при любом `masking.enabled` (сборка `msvc` проверяется в CI)
+- [x] T5b. `release.yml`: `v8-session-manager-*`, без macOS, обязательное Windows-задание с `cargo test`; README, `docs/INSTALL.md`, `docs/CONFIGURATION.md`
+- [ ] T6. Совместная проверка двух `.exe` (менеджер + служба) на Windows, включая вторую учётную запись и `\localhost\pipe\...`
+- [ ] T7. Приёмка: проверка с настоящей 1С (А4), упакованный комплект вне дерева исходников

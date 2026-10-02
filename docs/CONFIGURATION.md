@@ -114,8 +114,43 @@ Prometheus exporter.
 
 ## Секция `masking`
 
-По умолчанию интеграция выключена. При `enabled: true` обязательны UDS сервиса,
-UDS internal endpoint менеджера и UID peer-а сервиса.
+По умолчанию интеграция выключена. При `enabled: true` обязательны адрес службы,
+адрес internal endpoint менеджера и идентичность службы: Linux — `service_expected_uid`,
+Windows — `service_expected_exe` (и, при необходимости, `service_expected_sid`).
+
+Параметры идентичности службы:
+
+| Параметр | Linux | Windows |
+|----------|-------|---------|
+| `service_expected_uid` | обязателен | ошибка конфигурации |
+| `service_expected_sid` | ошибка конфигурации | необязателен; по умолчанию SID текущего процесса |
+| `service_expected_exe` | ошибка конфигурации | обязателен, значения по умолчанию нет; полный путь |
+
+Адреса `socket_path` и `internal_listen_path` — один и тот же тип (путь), смысл задаёт
+ОС: Linux — абсолютный путь сокета, Windows — локальное имя канала `\\.\pipe\<имя>`
+(удалённые имена, `/` и вложенные разделители отвергаются). Значения
+по умолчанию Linux прежние; Windows: `\\.\pipe\1c-masking-service` и
+`\\.\pipe\1c-masking-manager`. Поле чужой ОС — ошибка запуска; сообщение называет
+параметр и причину, но не значение.
+
+### Windows: именованные каналы
+
+Пример для Windows с явными путями (одна учётная запись без прав администратора):
+
+```yaml
+workPath: C:\ProgramData\v8-session-manager\state
+
+masking:
+  enabled: true
+  socket_path: \\.\pipe\1c-masking-service
+  internal_listen_path: \\.\pipe\1c-masking-manager
+  service_expected_sid: S-1-5-21-1111111111-2222222222-3333333333-1001   # необязательно
+  service_expected_exe: C:\masking\masking-service.exe                  # обязательно, без значения по умолчанию
+```
+
+Менеджер подключается к службе только после проверки SID и `.exe` процесса на другом
+конце канала; при любой неопределённости (нет PID, SID, пути) вызов закрывается.
+Изоляция от враждебного процесса той же учётной записи не заявляется.
 
 Понятия «разговора» у вызова нет: токены маскирования общие для всех
 вызывающих одной базы. Вызывающий передаётся сервису только как атрибут
@@ -159,10 +194,11 @@ UDS internal endpoint менеджера и UID peer-а сервиса.
 
 ### Internal endpoint менеджера
 
-`internal_listen_path` — UDS в том же shared volume, что и socket сервиса.
-На нём менеджер принимает `POST /internal/v1/tools/call`
+`internal_listen_path` — на Linux UDS в том же shared volume, что и socket сервиса; на
+Windows именованный канал. На нём менеджер принимает `POST /internal/v1/tools/call`
 (`{cluster_server, infobase_name, [cluster_guid, infobase_guid], name,
-arguments}`) только от peer-а с UID `service_expected_uid`; unknown tool,
+arguments}`) только от ожидаемой службы (Linux — UID `service_expected_uid`,
+Windows — SID `service_expected_sid`); unknown tool,
 чужой UID и неоднозначный target отклоняются фиксированными error-кодами.
 `internal_call_timeout_ms` — таймаут dispatch в сессию 1С.
 
