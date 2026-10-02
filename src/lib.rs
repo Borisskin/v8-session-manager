@@ -8,6 +8,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod local_ipc;
 pub mod mcp;
 pub mod output;
 pub mod session_manager;
