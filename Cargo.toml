@@ -2,6 +2,7 @@
 name = "v8-session-manager"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.91"
 
 [lib]
 name = "v8_session_manager"
