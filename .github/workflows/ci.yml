@@ -29,3 +29,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
       - run: cargo test --locked
+
+  # Два настоящих .exe в Windows: служба и менеджер запускаются процессами, скрипт ходит в их
+  # именованные каналы как клиент (см. scripts/ci/windows-smoke.ps1). Заодно даёт артефакт —
+  # релизный v8-session-manager.exe — без публикации релиза.
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: manager
+      # Служба берётся из ветки с тем же переносом; после слияния сменить на основную ветку.
+      - uses: actions/checkout@v6
+        with:
+          repository: Borisskin/1c-masking-service
+          ref: feature/windows-named-pipe-ipc
+          path: service
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            manager
+            service
+      - name: Сборка менеджера
+        working-directory: manager
+        run: cargo build --release --locked
+      - name: Сборка службы
+        working-directory: service
+        run: cargo build --release --locked --bin masking-service
+      - name: Дымовая проверка двух .exe
+        shell: pwsh
+        run: >
+          ./manager/scripts/ci/windows-smoke.ps1
+          -ServiceExe service/target/release/masking-service.exe
+          -ManagerExe manager/target/release/v8-session-manager.exe
+          -WorkDir $env:RUNNER_TEMP/smoke
+      - name: Артефакт менеджера (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-session-manager-windows-x86_64
+          path: manager/target/release/v8-session-manager.exe
+          if-no-files-found: error
