@@ -1,0 +1,5 @@
+# Привязка к каналу stable, а не к номеру версии: локально, в CI (dtolnay/rust-toolchain@stable)
+# и в Docker (rust:1-bookworm) берётся актуальный stable. Нижняя граница — rust-version в Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
